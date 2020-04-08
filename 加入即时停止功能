@@ -1,0 +1,1126 @@
+/*
+该程序中加入了即时停止功能以及冲洗正常运行中的喷管来回伸缩功能并对调节程序进行了相应的改动。
+
+其中即时停止功能的“停止“分为两种停止情况：
+a.在喷杆伸出到水泵和分水阀打开前的停止。
+  步进电机是采用四相八拍的运行方式，该停止是每八拍检测一次停止指令，若有停止指令则
+  保存当前喷杆和分水阀电机的位置并退出电机驱动程序转而执行停止指令
+b.在冲洗正常运行时的停止
+  该程序中采用冲洗时喷杆来回伸缩的形式进行冲洗即喷杆电机回退35步后再前进35步，以此
+	循环往复。停止时是采用每次回退或者前进35步后进行停止指令检测，检测到停止指令后，
+	保存当前喷杆和分水阀电机的位置并退出电机驱动程序转而执行停止指令。因此该过程中的
+	停止只有在每次喷杆伸到最长处或者缩回35步后才会执行停止指令。
+
+该程序对调节指令中的水压档位的调节作了相应改动。在冲洗进行中执行调节指令时，程序会
+等喷杆伸到最长或者缩回35步后开始执行调节指令，执行时，喷杆会和分水阀同时运行，保证
+在调节过程中不耽误喷杆的来回清洗工作。
+*/
+#include	"config.h"
+#include	"delay.h"
+#include  "timer.h"
+#include  "USART1.h"
+#include  "EEPROM.h"
+
+#define JYF_On 1
+#define JYF_Off 0
+
+bit keysta1=1;
+bit keysta2=1;
+bit keysta3=1;
+bit keysta4=1;
+bit keysta5=1;
+bit keysta6=1;
+bit keysta7=1;
+bit keysta8=1;
+
+bit backup1=1;
+bit backup2=1;
+bit backup3=1;
+bit backup4=1;
+bit backup5=1;
+bit backup6=1;
+bit backup7=1;
+bit backup8=1;
+
+bit flag_stop=0;                     //停止标志位
+bit flag_running=0;                  //清洗中标志位
+bit flag_st=0;
+
+static u8 keybuff1=0xff;
+static u8 keybuff2=0xff;
+static u8 keybuff3=0xff;
+static u8 keybuff4=0xff;
+static u8 keybuff5=0xff;
+static u8 keybuff6=0xff;
+static u8 keybuff7=0xff;
+static u8 keybuff8=0xff;
+
+bit OutofWater(void);
+void Motor_Drive(u16 PT_Step,Pt_Dir,u16 FSF_Step,Fsf_Dir);
+void add_Calcu(u8 table[]);
+void Check_Key_Value();		          //键值检测
+void Motor_run();
+void ResMotor();                    //分水阀电机复位
+void Swap_table(u8 Table_S[],u8 Table_D[]);		
+u8 xdata Table1[8]={0x08,0x0c,0x04,0x06,0x02,0x03,0x01,0x09};  	//反转（喷头回退）
+u8 xdata Table2[8]={0x09,0x01,0x03,0x02,0x06,0x04,0x0c,0x08};  	//正转（喷头前伸）
+u8 Table_P[8];
+u8 Table_F[8];
+
+u8 idata Table3[8]={0x33,0x00,0x28,0x00,0x00,0x00,0x00,0x28};		//水温设定30~40℃  对应1EH~28H
+
+
+//u16 addr1=0x0000;				//
+u16 addr2=0x0200;					//存喷头电机状态
+//u16 addr3=0x0400;				//存分水阀电机状态
+u16 addr4=0x0600;					//存分水阀最近指令状态
+
+
+u8 Control_t=0;         	//按键指令
+u8 Pwr=0;									//电源状态值
+u8 Control_Hg=0;					//热风机状态值
+u8 Control_Sb=0;					//水泵状态值
+u8 Hg_Cnt=0;							//烘干调节计数器
+
+u16 Step_pt=0;					//喷头步数
+u16 Step_fsf=0;	 					//分水阀步数
+
+u8 P_Dir=0;              //喷头正反转指示
+u8 F_Dir=0;             //分水阀正反转指示
+
+u8 Heater_Ena=0;					//加热模块使能
+u8 Heater_Cnt=0;					//加热挡位切换计数器
+
+u8 Dir=0;									//水压调节方向指示
+u8 Sum=0;
+static u16 a=0; 					//中断累加器
+
+bit NeedWater=0;					//缺水状态
+
+
+/*****************定时器初始化***********************/
+void	Timer_config(void)
+{
+	TIM_InitTypeDef		TIM_InitStructure;										//
+	TIM_InitStructure.TIM_Mode      = TIM_16BitAutoReload;	//
+	TIM_InitStructure.TIM_Polity    = PolityHigh;						//
+	TIM_InitStructure.TIM_Interrupt = ENABLE;								//
+	TIM_InitStructure.TIM_ClkSource = TIM_CLOCK_1T;			
+	TIM_InitStructure.TIM_ClkOut    = ENABLE;								//
+	TIM_InitStructure.TIM_Value     = 0xa240;								//
+	TIM_InitStructure.TIM_Run       = ENABLE;								//
+	Timer_Inilize(Timer0,&TIM_InitStructure);								//
+}
+
+/********************串口初始化***********************/
+void	UART_config(void)
+{
+	COMx_InitDefine		COMx_InitStructure;									//
+	COMx_InitStructure.UART_Mode      = UART_8bit_BRTx;		//
+	COMx_InitStructure.UART_BRT_Use   = BRT_Timer2;				//
+	COMx_InitStructure.UART_BaudRate  = 2400ul;						//
+	COMx_InitStructure.UART_RxEnable  = ENABLE;						//
+	COMx_InitStructure.BaudRateDouble = DISABLE;					//
+	COMx_InitStructure.UART_Interrupt = ENABLE;						//
+	COMx_InitStructure.UART_Polity    = PolityHigh;				//
+	COMx_InitStructure.UART_P_SW      = UART1_SW_P30_P31;	//
+	COMx_InitStructure.UART_RXD_TXD_Short = DISABLE;			//
+	USART_Configuration(USART1, &COMx_InitStructure);			//
+}
+/*****************中断服务子程序*********************/
+void timer0_int (void) interrupt TIMER0_VECTOR	 
+{
+	keybuff1=(keybuff1<<1)|P20;
+	keybuff2=(keybuff2<<1)|P21;
+	keybuff3=(keybuff3<<1)|P22;
+	keybuff4=(keybuff4<<1)|P23;
+	keybuff5=(keybuff5<<1)|P24;
+	keybuff6=(keybuff6<<1)|P25;
+//	keybuff7=(keybuff7<<1)|P26;
+//	keybuff8=(keybuff8<<1)|P27;
+
+	if(keybuff1==0x00)	keysta1=0;
+	else if(keybuff1==0xff) keysta1=1;
+	else{}
+
+	if(keybuff2==0x00)	keysta2=0;
+	else if(keybuff2==0xff) keysta2=1;
+	else{}
+
+	if(keybuff3==0x00)	keysta3=0;
+	else if(keybuff3==0xff) keysta3=1;
+	else{}
+
+	if(keybuff4==0x00)	keysta4=0;
+	else if(keybuff4==0xff) keysta4=1;
+	else{}
+		
+	if(keybuff5==0x00)	keysta5=0;
+	else if(keybuff5==0xff) keysta5=1;
+	else{}
+		
+	if(keybuff6==0x00)	keysta6=0;
+	else if(keybuff6==0xff) keysta6=1;
+	else{}
+		
+//	if(keybuff7==0x00)	keysta7=0;
+//	else if(keybuff7==0xff) keysta7=1;
+//	else{}
+
+//	if(keybuff8==0x00)	keysta8=0;
+//	else if(keybuff8==0xff) keysta8=1;
+//	else{}
+
+	a++;
+		
+	if(a==250)  PrintString1(Table3);
+		
+	if(a>250)		a=0;
+}
+
+void main(void)
+{
+	bit Motor_State1=0;							//喷头电机状态 	（0代表初始状态，1代表就位状态）
+//	bit Motor_State2=1;							//分水阀电机状态（0代表初始状态，1代表就位状态）
+	u8 Motor_Fsf_Cmd=0x00;					//0x07:通用清洗分水阀电机未归位
+																	//0x01:妇洗清洗分水阀未归位
+	    														//0xff:分水阀位于初始位置
+	u8 i;	
+//	u8 ZiJie_Cnt=0;
+	P1M1 = 0x00;	P1M0 = 0xff;
+	P2M1 = 0x00;	P2M0 = 0x00;
+	P0M1 = 0x00;  P0M0 = 0x00;   		//I/O口模式设置
+//	P35=1;
+	P34=0;
+	P1=0x00;
+	P0=0x00;
+	P34=1;
+	
+	P15=0;													//C
+	P16=1;													//B
+	P17=1;													//A	
+	
+	P26=0;													//缺水指示
+	
+	UART_config();									//串口参数设置
+	Timer_config();									//定时器参数设置
+	
+//	if(EEPROM_read_n(addr2)!=0xff)
+//	{
+//		Motor_State1=1;
+//		if(EEPROM_read_n(addr4)!=0xff)
+//			Motor_Fsf_Cmd=EEPROM_read_n(addr4);
+//	}																//读取掉电前状态
+//	if(Motor_State1==1)
+//	{
+//		Swap_table(Table1,Table);	
+//		if(Motor_Fsf_Cmd==0x07)
+//		{
+//			Step_fsf=192;
+//		}else if(Motor_Fsf_Cmd==0x01)
+//		{
+//			Step_fsf=448;
+//		}
+//		
+//		Motor_Drive(Step_pt,Step_fsf);
+
+//		Motor_State1=0;
+//	}																//电机复位
+	ResMotor();                     //分水阀电机复位
+	EEPROM_SectorErase(addr2);  
+	delay_ms(25);
+	EEPROM_SectorErase(addr4);
+	delay_ms(25);										//清除E2PROM内容
+
+	EA=1;														//允许中断
+	
+//	Swap_table(Table1,Table);
+//	Motor_Drive(0,448);
+	
+	while(1)
+	{
+		Check_Key_Value();	
+		if (COM1.RX_Cnt==8)
+		{
+			for(i=1;i<=6;i++)
+			{
+			 Sum+=RX1_Buffer[i];
+			}
+			if(Sum==RX1_Buffer[7])
+			{
+				Sum=0;
+				if(RX1_Buffer[4]>=0x2B)
+				{
+				  Heater_Ena=0;
+					Heater_Cnt=0;
+					Table3[1]=Heater_Ena;
+					add_Calcu(Table3);
+				}
+			}
+		}
+//		if(OutofWater()&&NeedWater)
+//		{
+////			Control_t=1;
+//			NeedWater=0;
+//		}
+		switch(Control_t)
+		{
+			case 1:											//电源
+				Pwr=Pwr%2;							//电源标志位更新
+				if(Pwr)
+				{
+					P15=1;
+					P17=0;
+					P16=1;
+				}					
+				else 
+				{
+					P15=0;
+					P17=1;
+					P16=1;
+				}
+				if(Control_Hg!=0)				//若此时风机正在工作
+				{
+	//				P17=1;
+	//				P16=1;
+					if(P13==1)						//若此时正好是加热状态（中温）
+					{
+						P13=0;							//断交流电
+						delay_ms(250);
+						delay_ms(250);
+						delay_ms(250);
+						delay_ms(250);			//延迟1秒
+					}
+					if(P14==1)						//若此时正好是加热状态（高温）
+					{
+						P14=0;
+						delay_ms(250);
+						delay_ms(250);					
+						delay_ms(250);
+						delay_ms(250);			//延迟1秒
+					}
+					P11=0;								//关闭风机
+					Hg_Cnt=0;
+					Control_Hg=0;					//风机标志位置0
+				}
+				if(Control_Sb!=0)				//如果正在清洗
+				{
+	//				P17=1;
+	//				P16=1;
+					Heater_Ena=0;					//加热使能清零
+					Table3[1]=Heater_Ena;	
+					Table3[2]=0x28;				//修改协议数组内容
+					add_Calcu(Table3);		//校验位计算
+					delay_ms(10);
+					
+					P12=0;	    					//关水泵
+					delay_ms(150);
+					P10=JYF_Off; 					//关电磁阀
+					delay_ms(250);
+					
+					if(Step_fsf>220)			//女用冲洗
+					 {
+						P_Dir=1;
+						F_Dir=0; 
+						Motor_Drive(Step_pt,P_Dir,Step_fsf-220,F_Dir);
+					 }
+					 else
+					 {								//通用冲洗
+						P_Dir=0;
+						F_Dir=1;
+						Motor_Drive(Step_pt,P_Dir,220-Step_fsf,F_Dir);
+					 }
+
+          Control_Sb=0;					//水泵标志复位
+					Heater_Cnt=0;					//加热档位清零
+					flag_running=0;        //停止冲洗
+					
+					EEPROM_SectorErase(addr2);   //清除E2PROM内容
+					delay_ms(25);
+					EEPROM_SectorErase(addr4);
+					delay_ms(25);
+				}
+				if(flag_st==1)
+				 {
+					flag_st=0;
+					if(Step_fsf>220)			//女用冲洗转停止
+					{
+					P_Dir=1;
+					Motor_Drive(Step_pt,P_Dir,(Step_fsf-220),0);
+					Step_fsf=220; 
+					}
+					else
+					{								//通用冲洗转停止
+					P_Dir=0;
+					Motor_Drive(Step_pt,P_Dir,(220-Step_fsf),1);
+					Step_fsf=220;
+					}
+				 }
+				Pwr++;
+				flag_stop=0;
+				Control_t=0;
+				break;
+			case 2:											//停止
+				if(Pwr!=0)
+				{
+//					switch(Heater_Cnt)
+//					{
+//						case 0x00:
+//							P17=0;
+//							P16=1;
+//							break;
+//						case 0x01:
+//							P17=0;
+//							P16=0;
+//							break;
+//						case 0x02:
+//							P17=1;
+//							P16=0;
+//							break;
+//						default:
+//							break;
+//					}
+					if(Control_Hg!=0)
+					{
+						switch(Hg_Cnt)
+						{
+							case 0x00:
+								P17=0;
+								P16=1;
+								break;
+							case 0x01:
+								P17=0;
+								P16=0;
+								break;
+							case 0x02:
+								P17=1;
+								P16=0;
+								break;
+							default:
+								break;
+						}
+						if(P13==1)						//若此时正好是加热状态（中温）
+						{
+							P13=0;							//断交流电
+							delay_ms(250);
+							delay_ms(250);
+							delay_ms(250);
+							delay_ms(250);			//延迟1秒
+						}
+						if(P14==1)						//若此时正好是加热状态（高温）
+						{
+							P14=0;
+							delay_ms(250);
+							delay_ms(250);					
+							delay_ms(250);
+							delay_ms(250);			//延迟1秒
+						}
+						P11=0;								//关闭风机
+						Control_Hg=0;					//风机标志位置0
+						Hg_Cnt=0;							//风温挡位切换计数器清零
+						
+					}
+					if(Control_Sb!=0)
+					{												//若此时为冲洗状态
+						switch(Heater_Cnt)
+						{
+							case 0x00:
+								P17=0;
+								P16=1;
+								break;
+							case 0x01:
+								P17=0;
+								P16=0;
+								break;
+							case 0x02:
+								P17=1;
+								P16=0;
+								break;
+							default:
+								break;
+						}
+						Heater_Ena=0;					//加热使能清零
+						Table3[1]=Heater_Ena;
+						Table3[2]=0x28;
+						add_Calcu(Table3);			
+						P12=0;								//关闭水泵
+						delay_ms(50);		
+						P10=JYF_Off;					//关闭减压阀
+//						Heater_Cnt=0;					//水温挡位切换计数器清零
+//						Motor_Drive(Step_pt,Step_fsf);     	//电机复位
+//					 if(Step_fsf>256)			//女用冲洗转自洁
+//						 {
+//							Motor_Drive(0,(Step_fsf-256));
+//						  }
+//						else
+//							{								//通用冲洗转自洁
+//							Swap_table(Table2,Table);
+//							Motor_Drive(0,(256-Step_fsf));
+//							Swap_table(Table1,Table);
+//						  }
+						 if(Step_fsf>220)			//女用冲洗转自洁
+						 {
+							P_Dir=1;
+							Motor_Drive(0,0,(Step_fsf-250),0);
+							Step_fsf=250; 
+						  }
+						else
+							{								//通用冲洗转自洁
+							P_Dir=0;
+							Motor_Drive(0,0,(190-Step_fsf),1);
+              Step_fsf=190;
+						  }
+						P10=JYF_On;						//再次打开减压阀
+						delay_ms(50);
+						P12=1;								//开启水泵
+						delay_ms(50);
+						Motor_Drive(Step_pt,P_Dir,0,0);
+						delay_ms(250);
+						delay_ms(250);
+						delay_ms(250);
+						delay_ms(250);
+						delay_ms(250);
+						delay_ms(250);
+						delay_ms(250);
+						delay_ms(250);						
+						P12=0;								//关闭水泵
+						delay_ms(50);
+						P10=JYF_Off;					//关闭减压阀
+							
+						if(Step_fsf>220)			//
+						 {
+							P_Dir=1;
+							Motor_Drive(0,0,(Step_fsf-220),0);
+							Step_fsf=220; 
+						  }
+						else
+							{								//
+							P_Dir=0;
+							Motor_Drive(0,0,(220-Step_fsf),1);
+              Step_fsf=220;
+						  }
+							
+//						Motor_Drive(0,0,210,0);
+						Control_Sb=0;					//水泵状态位清零
+						Dir=0;
+						flag_running=0;        //停止冲洗
+							
+						EEPROM_SectorErase(addr2);   
+						delay_ms(25);
+						EEPROM_SectorErase(addr4);
+						delay_ms(25);					//清除E2PROM内容
+					}
+				  if(flag_st==1)
+					{
+						flag_st=0;
+						if(Step_fsf>220)			//女用冲洗转停止
+					  {
+						P_Dir=1;
+						Motor_Drive(Step_pt,P_Dir,(Step_fsf-220),0);
+						Step_fsf=220; 
+						}
+						else
+						{								//通用冲洗转停止
+						P_Dir=0;
+						Motor_Drive(Step_pt,P_Dir,(220-Step_fsf),1);
+						Step_fsf=220;
+						}
+					}
+				}
+				flag_stop=0;
+				Control_t=0;
+				break;
+			case 3:											//调节
+				if(Pwr!=0)
+				{
+					if((Control_Hg!=0)&&(Control_Sb==0))
+					{												//风机打开时  
+						Hg_Cnt++;
+						Hg_Cnt=Hg_Cnt%3;			//计数器取余	                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 						
+						switch(Hg_Cnt)
+						{
+							case 0:							//高温
+								P14=1;
+								delay_ms(50);
+								P13=0;
+								
+								P17=0;						//反馈
+								P16=1;
+								break;
+							case 1:							//中温
+								P14=0;
+								delay_ms(50);
+								P13=1;
+							
+								P17=0;						//反馈
+								P16=0;
+								break;
+							case 2:							//冷风
+								P13=0;
+								delay_ms(50);
+								P14=0;
+							
+								P17=1;						//反馈
+								P16=0;
+								break;
+							default:
+								break;		
+						}
+					}
+					if((Heater_Ena==0)&&(Control_Hg==0))
+					{												//若既不在加热也不在烘干
+						Heater_Cnt++;				
+						Heater_Cnt=Heater_Cnt%3;
+																	//计数器取余	  
+						switch(Heater_Cnt)
+						{
+							case 0:							//高温约40℃
+								Table3[2]=0x28;
+								
+								P17=0;						//反馈
+								P16=1;
+								break;
+							case 1:							//中温约35℃
+								Table3[2]=0x23;
+								
+								P17=0;						//反馈
+								P16=0;
+								break;
+							case 2:							//低温约30℃
+								Table3[2]=0x1e;
+								
+								P17=1;						//反馈
+								P16=0;
+								break;
+						}
+						add_Calcu(Table3);
+					}
+					if((Heater_Ena!=0)&&(Control_Hg==0))
+																	//加热水时调节水压——分水阀换挡
+																	//必须知道此时是什么清洗
+					{
+						if(Step_fsf>220)			//女性冲洗
+						{
+							if(Dir==0)							//默认方向
+							{
+								if(Step_fsf==320)			//女用一档，执行完成后挡位变成女用二档
+								{
+									P17=0;						//反馈
+									P16=0;
+									if(Step_pt==100)
+									{
+									  Motor_Drive(35,1,30,1);
+										Motor_Drive(35,0,30,1);
+									}
+									else if(Step_pt==65)
+									{
+									  Motor_Drive(35,0,30,1);
+										Motor_Drive(35,1,30,1);
+									}
+									Step_fsf=Step_fsf+60;
+																
+								}else if(Step_fsf==380)			//女用二档，执行完成后变为女用三档
+								{
+									P17=1;						//反馈
+									P16=0;
+									if(Step_pt==100)
+									{
+									  Motor_Drive(35,1,30,1);
+										Motor_Drive(35,0,30,1);
+									}
+									else if(Step_pt==65)
+									{
+									  Motor_Drive(35,0,30,1);
+										Motor_Drive(35,1,30,1);
+									}
+									Step_fsf=Step_fsf+60;
+									Dir=1;							//此时执行完成，处于女用三档，更换调节方向为三档向一档调节
+									
+								}							
+							}else if(Dir==1)							//此时挡位处于女用三档
+							{
+								if(Step_fsf==440)
+								{
+									P17=0;						//反馈
+									P16=0;
+									if(Step_pt==100)
+									{
+									  Motor_Drive(35,1,30,0);
+										Motor_Drive(35,0,30,0);
+									}
+									else if(Step_pt==65)
+									{
+									  Motor_Drive(35,0,30,0);
+										Motor_Drive(35,1,30,0);
+									}
+									Step_fsf=Step_fsf-60;
+									
+								}else if(Step_fsf==380)
+								{
+									P17=0;						//反馈
+									P16=1;
+									if(Step_pt==100)
+									{
+									  Motor_Drive(35,1,30,0);
+										Motor_Drive(35,0,30,0);
+									}
+									else if(Step_pt==65)
+									{
+									  Motor_Drive(35,0,30,0);
+										Motor_Drive(35,1,30,0);
+									}
+									Step_fsf=Step_fsf-60;
+									Dir=0;
+								}
+							}							
+						}
+						if(Step_fsf<220)					//通用冲洗
+						{
+							if(Dir==0)
+							{
+								if(Step_fsf==120)
+								{
+									P17=0;						//反馈
+									P16=0;
+									
+									if(Step_pt==100)
+									{
+									  Motor_Drive(35,0,30,0);
+										Motor_Drive(35,1,30,0);
+									}
+									else if(Step_pt==65)
+									{
+									  Motor_Drive(35,1,30,0);
+										Motor_Drive(35,0,30,0);
+									}
+									Step_fsf=Step_fsf-60;
+								}else if(Step_fsf==60)
+								{
+									P17=1;						//反馈
+									P16=0;
+									if(Step_pt==100)
+									{
+									  Motor_Drive(35,0,30,0);
+										Motor_Drive(35,1,30,0);
+									}
+									else if(Step_pt==65)
+									{
+									  Motor_Drive(35,1,30,0);
+										Motor_Drive(35,0,30,0);
+									}
+									Step_fsf=Step_fsf-60;
+									Dir=1;
+								}								
+							}else if(Dir==1)
+							{
+								if(Step_fsf==0)
+								{
+									P17=0;						//反馈
+									P16=0;
+									if(Step_pt==100)
+									{
+									  Motor_Drive(35,0,30,1);
+										Motor_Drive(35,1,30,1);
+									}
+									else if(Step_pt==65)
+									{
+									  Motor_Drive(35,1,30,1);
+										Motor_Drive(35,0,30,1);
+									}
+									Step_fsf=Step_fsf+60;
+									
+								}else if(Step_fsf==60)
+								{
+									P17=0;						//反馈
+									P16=1;
+									if(Step_pt==100)
+									{
+									  Motor_Drive(35,0,30,1);
+										Motor_Drive(35,1,30,1);
+									}
+									else if(Step_pt==65)
+									{
+									  Motor_Drive(35,1,30,1);
+										Motor_Drive(35,0,30,1);
+									}
+									Step_fsf=Step_fsf+60;
+									Dir=0;
+									
+								}							
+							}							
+						}
+					}
+				}
+				Control_t=0;
+				break;	
+			case 4:											//通用冲洗
+				if(Pwr!=0)
+				{
+					if((Control_Sb!=1)&&(Control_Hg==0))
+					{
+						EEPROM_SectorErase(addr2);   
+						delay_ms(25);
+						EEPROM_SectorErase(addr4);
+						delay_ms(25);					//清除E2PROM内容
+						Step_pt=100;
+						Step_fsf=120;
+						P17=0;								//反馈
+						P16=1;
+						EEPROM_write_n(addr2,0x00);
+						delay_ms(100);
+						EEPROM_write_n(addr4,0x03);
+						delay_ms(100);					//写E2PROM内容
+						
+						Motor_Drive(Step_pt,1,220-Step_fsf,0);         //分水阀就位
+						if(flag_st==1)
+						{
+							break;
+						}
+						P10=JYF_On;						//打开电磁阀
+						delay_ms(25);
+						P12=1;								//打开水泵
+						Control_Sb=1;					//水泵状态位置1
+						
+						Heater_Ena=1;					//加热使能位置1
+						Table3[1]=Heater_Ena;	//修改协议数组内容
+						add_Calcu(Table3);		//计算校验位
+					  flag_running=1;       //冲洗中
+						flag_stop=1;          //禁止即时停止
+					}
+				}
+				Control_t=0;
+				break;	
+			
+			case 5:											//烘干
+				if(Pwr!=0)								//电源开的情况下
+				{
+					if((Control_Hg!=1)&&(Control_Sb==0))	
+																	//烘干及水泵均没开
+					{
+						Control_Hg=1;					//风机状态寄存器置1	
+						P11=1;								//风机打开
+						delay_ms(50);
+						P13=0;
+						delay_ms(50);
+						P14=1;
+						
+						P17=0;						//反馈
+						P16=1;
+					}
+				}
+				Control_t=0;
+				break;
+					
+			case 6:											//女性冲洗
+				if(Pwr!=0)
+				{
+					if((Control_Sb!=1)&&(Control_Hg==0))
+					{												//水泵及烘干均不在工作
+						EEPROM_SectorErase(addr2);   
+						delay_ms(25);
+						EEPROM_SectorErase(addr4);
+						delay_ms(25);					//清除E2PROM内容
+						Step_pt=100;
+						Step_fsf=320;
+						P17=0;						//反馈
+						P16=1;
+						EEPROM_write_n(addr2,0x00);
+						delay_ms(100);
+						EEPROM_write_n(addr4,0x05);
+						delay_ms(100);					//写E2PROM内容
+						Motor_Drive(Step_pt,0,Step_fsf-220,1);     //分水阀就位
+						if(flag_st==1)
+						{
+							break;
+						}
+						P10=JYF_On;						//打开电磁阀
+						delay_ms(25);
+						P12=1; 								//打开水泵
+						Control_Sb=1;					//水泵状态位置1
+						
+						
+						Heater_Ena=1;					//加热使能位置1
+						Table3[1]=Heater_Ena;	//修改协议数组内容
+						add_Calcu(Table3);		//计算校验位
+						flag_running=1;       //冲洗中
+						flag_stop=1;          //禁止即时停止
+					}
+				}
+				Control_t=0;
+				break;
+			default:
+				break;
+		}
+	 Motor_run();
+	}
+}
+void Motor_run()                //冲洗过程中喷头来回伸缩程序，中途检测到电源/停止/调节指令后退出
+{
+	if(flag_running==1)
+	{
+		Check_Key_Value();	
+		if(Step_fsf>220)        //女性冲洗
+		{
+			if(Step_pt==100)
+			{
+				Step_pt=65;
+			  Motor_Drive(35,1,0,0);
+		  	if(Control_t==1|Control_t==2|Control_t==3)
+		  	{
+			  	return;
+			  }
+		  }
+			if(Step_pt==65)
+			{
+				Step_pt=100;
+				Motor_Drive(35,0,0,0);
+		  }
+		}
+		else                     //通用冲洗
+		{
+			if(Step_pt==100)
+			{
+				Step_pt=65;
+				Motor_Drive(35,0,0,0);
+				if(Control_t==1|Control_t==2|Control_t==3)
+				{
+					return;
+				}
+		  }
+			if(Step_pt==65)
+			{
+				Step_pt=100;
+				Motor_Drive(35,1,0,0);
+		  }
+		}
+	}
+}
+void Swap_table(u8 Table_S[],u8 Table_D[])
+{
+	u8 i;
+	for(i=0;i<=7;i++)
+	{
+		Table_D[i]=Table_S[i];
+	}
+}
+
+void Check_Key_Value()
+{
+	if(keysta1!=backup1)
+	{
+		if(backup1==0)						//电源
+		{
+		  Control_t=1;	
+		}
+		backup1=keysta1;
+	}
+
+	if(keysta2!=backup2)
+	{
+		if(backup2==0)						//停止
+		{
+			Control_t=2;
+		}
+		backup2=keysta2;
+	}
+
+	if(keysta3!=backup3)				//调节
+	{
+		if(backup3==0)
+		{
+			Control_t=3;
+		}
+		backup3=keysta3;
+	}
+
+	if(keysta4!=backup4)				//通用冲洗
+	{
+		if(backup4==0)
+		{
+			Control_t=4;
+
+		}
+		backup4=keysta4;
+	}
+
+	if(keysta5!=backup5)				//烘干
+	{
+		if(backup5==0)
+		{
+			Control_t=5;
+		}
+		backup5=keysta5;
+	}
+	
+	if(keysta6!=backup6)				//女性冲洗
+	{
+		if(backup6==0)
+		{
+			Control_t=6;
+
+		}
+		backup6=keysta6;
+	}
+
+//	if(keysta7!=backup7)				//未接线，待用
+//	{
+//		if(backup7==0)
+//		{
+//			Control_t=7;
+//		}
+//		backup7=keysta7;
+//	}
+
+//	if(keysta8!=backup8)				//未接线，待用
+//	{
+//		if(backup8==0)
+//		{
+//			Control_t=8;
+//		}
+//		backup8=keysta8;
+//	}
+}
+
+
+//}
+
+void add_Calcu(u8 table[])
+{
+	u8 i;
+	u8 calcu=table[1];
+	for(i=2;i<7;i++)
+	{
+		calcu+=table[i];
+	}
+	table[7]=calcu;
+}
+
+void Motor_Drive(u16 PT_Step,Pt_Dir,u16 FSF_Step,Fsf_Dir)
+{													//喷头在低位，分水阀在高位
+	u16 i,j;
+	u8 table_t;										//临时变量，存P0口高四位数据
+	if(Pt_Dir==1)
+	{
+		Swap_table(Table1,Table_P);
+	}
+	else if(Pt_Dir==0)
+	{Swap_table(Table2,Table_P);}
+	
+	if(Fsf_Dir==1)
+	{
+		Swap_table(Table1,Table_F);
+	}
+	else if(Fsf_Dir==0)
+	{Swap_table(Table2,Table_F);}
+	
+	if(PT_Step>=FSF_Step)							//若喷管电机步数大于分水阀电机步数
+	{
+		for(i=0;i<PT_Step;i++)						//最外层的循环为喷管电机的步数
+		{	
+			Check_Key_Value();	
+      if(Control_t==1|Control_t==2)			
+			{
+				if(flag_stop==0)
+				{
+					flag_stop=1;
+					flag_st=1;
+					if(i<FSF_Step)
+					{
+						if(Fsf_Dir==1)
+						{
+						  Step_fsf=Step_fsf-FSF_Step+i;         //当前分水阀位置
+						}
+						else
+						{
+							Step_fsf=Step_fsf+FSF_Step-i;         //当前分水阀位置
+						} 
+					}
+          Step_pt=i;                        //当前喷头位置
+					return ;
+				}
+			}
+			for(j=0;j<=7;j++)					
+			{
+				if(i<FSF_Step)						//若此时步数仍是小于分水阀步数，则两个电机同时前进		
+				{	
+					table_t=Table_F[7-j];				//分水阀与喷管的正反定义相反，故分水阀要倒序取数组中的值，节拍值存在table_t中
+			    P34=0;
+					P0|=Table_P[j]+(table_t<<4);		//分水阀在高四位，喷管在低四位，要将table_t的值左移四位
+					P34=1;
+					delay_ms(3);					//延时2ms
+				  P34=0;
+					P0=0x00;						//四相全部拉高
+				  P34=1;
+					delay_ms(3);					//一个脉冲约4ms，信号频率250Hz
+				}
+				else
+				{								//若此时步数大于分水阀步数，则仅驱动喷管电机
+					P34=0;
+					P0|=Table_P[j];					//此时Table[]数组仅低四位有数据，高四位为0，分水阀电机不动作
+			    P34=1;
+					delay_ms(3);  
+					P34=0;
+					P0=0x00;
+					P34=1;
+					delay_ms(3);
+				}
+			}
+		}
+	}else{
+		for(i=0;i<FSF_Step;i++)						//这部分和上面类似，只是将FSF_Step和PT_Step互换
+		{	
+//      if(Control_t==1|Control_t==2)			        //无该种需求停止情况
+//			{
+//				if(flag_stop==0)
+//				{
+//					flag_stop=1;
+//					if(i<PT_Step)
+//					{
+//						if(F_Dir==1);
+//						{
+//						  Step_fsf=Step_fsf-FSF_Step+i;         //当前分水阀位置
+//						}
+//						else
+//						{
+//							Step_fsf=Step_fsf+FSF_Step-i;         //当前分水阀位置
+//						} 
+//					}
+//          Step_pt=PT_Step-i;                        //当前喷头位置
+//					return ;
+//				}
+//			}			
+			for(j=0;j<=7;j++)					
+			{
+				if(i<PT_Step)
+				{	
+					table_t=Table_F[7-j];
+					P34=0;
+					P0|=Table_P[j]+(table_t<<4);
+				  P34=1;
+					delay_ms(3);
+				  P34=0;
+					P0=0x00;
+					P34=1;
+					delay_ms(3);
+				}else{
+					table_t=Table_F[7-j];
+			    P34=0;
+					P0|=table_t<<4;
+				  P34=1;
+					delay_ms(3);
+					P34=0;
+					P0=0x00;
+				  P34=1;
+					delay_ms(3);
+				}
+			}
+		}
+	}
+}
+void ResMotor()
+{
+ flag_stop=1;
+ Motor_Drive(0,0,480,0);
+ Motor_Drive(0,0,220,1);
+ flag_stop=0;
+}
